@@ -1,8 +1,9 @@
 import type { AgentMessage } from "@mariozechner/pi-agent-core";
 import { parseReplyDirectives } from "../auto-reply/reply/reply-directives.js";
 import { createStreamingDirectiveAccumulator } from "../auto-reply/reply/streaming-directives.js";
-import { formatToolAggregate } from "../auto-reply/tool-meta.js";
 import { isSilentReplyText, SILENT_REPLY_TOKEN } from "../auto-reply/tokens.js";
+import { formatToolAggregate } from "../auto-reply/tool-meta.js";
+import { setReplyPayloadMetadata } from "../auto-reply/types.js";
 import { emitAgentEvent } from "../infra/agent-events.js";
 import { createSubsystemLogger } from "../logging/subsystem.js";
 import type { InlineCodeState } from "../markdown/code-spans.js";
@@ -19,6 +20,7 @@ import type {
   EmbeddedPiSubscribeContext,
   EmbeddedPiSubscribeState,
 } from "./pi-embedded-subscribe.handlers.types.js";
+import { isPromiseLike } from "./pi-embedded-subscribe.promise.js";
 import { filterToolResultMediaUrls } from "./pi-embedded-subscribe.tools.js";
 import type { SubscribeEmbeddedPiSessionParams } from "./pi-embedded-subscribe.types.js";
 import { formatReasoningMessage, stripDowngradedToolCallText } from "./pi-embedded-utils.js";
@@ -72,6 +74,7 @@ export function subscribeEmbeddedPiSession(params: SubscribeEmbeddedPiSessionPar
     compactionRetryResolve: undefined,
     compactionRetryReject: undefined,
     compactionRetryPromise: null,
+    compactionCleanupResolve: undefined,
     unsubscribed: false,
     messagingToolSentTexts: [],
     messagingToolSentTextsNormalized: [],
@@ -104,24 +107,45 @@ export function subscribeEmbeddedPiSession(params: SubscribeEmbeddedPiSessionPar
   const messagingToolSentMediaUrls = state.messagingToolSentMediaUrls;
   const pendingMessagingTexts = state.pendingMessagingTexts;
   const pendingMessagingTargets = state.pendingMessagingTargets;
+  const pendingBlockReplyTasks = new Set<Promise<void>>();
   const replyDirectiveAccumulator = createStreamingDirectiveAccumulator();
   const partialReplyDirectiveAccumulator = createStreamingDirectiveAccumulator();
   const shouldAllowSilentTurnText = (text: string | undefined) =>
     Boolean(text && isSilentReplyText(text, SILENT_REPLY_TOKEN));
   const emitBlockReplySafely = (
     payload: Parameters<NonNullable<SubscribeEmbeddedPiSessionParams["onBlockReply"]>>[0],
+    options?: { assistantMessageIndex?: number },
   ) => {
     if (!params.onBlockReply) {
       return;
     }
-    void Promise.resolve()
-      .then(() => params.onBlockReply?.(payload))
-      .catch((err) => {
+    try {
+      const taggedPayload =
+        options?.assistantMessageIndex !== undefined
+          ? setReplyPayloadMetadata(payload, {
+              assistantMessageIndex: options.assistantMessageIndex,
+            })
+          : payload;
+      const maybeTask = params.onBlockReply(taggedPayload);
+      if (!isPromiseLike<void>(maybeTask)) {
+        return;
+      }
+      const task = Promise.resolve(maybeTask).catch((err) => {
         log.warn(`block reply callback failed: ${String(err)}`);
       });
+      pendingBlockReplyTasks.add(task);
+      void task.finally(() => {
+        pendingBlockReplyTasks.delete(task);
+      });
+    } catch (err) {
+      log.warn(`block reply callback failed: ${String(err)}`);
+    }
   };
-  const emitBlockReply = (payload: BlockReplyPayload) => {
-    emitBlockReplySafely(consumePendingToolMediaIntoReply(state, payload));
+  const emitBlockReply = (
+    payload: BlockReplyPayload,
+    options?: { assistantMessageIndex?: number },
+  ) => {
+    emitBlockReplySafely(consumePendingToolMediaIntoReply(state, payload), options);
   };
 
   const resetAssistantMessageState = (nextAssistantTextBaseline: number) => {
@@ -492,7 +516,7 @@ export function subscribeEmbeddedPiSession(params: SubscribeEmbeddedPiSessionPar
     return output;
   };
 
-  const emitBlockChunk = (text: string) => {
+  const emitBlockChunk = (text: string, options?: { assistantMessageIndex?: number }) => {
     if (state.suppressBlockChunks || params.silentExpected) {
       return;
     }
@@ -539,14 +563,19 @@ export function subscribeEmbeddedPiSession(params: SubscribeEmbeddedPiSessionPar
     if (!cleanedText && (!mediaUrls || mediaUrls.length === 0) && !audioAsVoice) {
       return;
     }
-    emitBlockReply({
-      text: cleanedText,
-      mediaUrls: mediaUrls?.length ? mediaUrls : undefined,
-      audioAsVoice,
-      replyToId,
-      replyToTag,
-      replyToCurrent,
-    });
+    emitBlockReply(
+      {
+        text: cleanedText,
+        mediaUrls: mediaUrls?.length ? mediaUrls : undefined,
+        audioAsVoice,
+        replyToId,
+        replyToTag,
+        replyToCurrent,
+      },
+      {
+        assistantMessageIndex: options?.assistantMessageIndex ?? state.assistantMessageIndex,
+      },
+    );
   };
 
   const consumeReplyDirectives = (text: string, options?: { final?: boolean }) =>
@@ -554,19 +583,27 @@ export function subscribeEmbeddedPiSession(params: SubscribeEmbeddedPiSessionPar
   const consumePartialReplyDirectives = (text: string, options?: { final?: boolean }) =>
     partialReplyDirectiveAccumulator.consume(text, options);
 
-  const flushBlockReplyBuffer = () => {
+  const flushBlockReplyBuffer = (options?: {
+    assistantMessageIndex?: number;
+  }): void | Promise<void> => {
     if (!params.onBlockReply) {
       return;
     }
     if (blockChunker?.hasBuffered()) {
-      blockChunker.drain({ force: true, emit: emitBlockChunk });
+      blockChunker.drain({ force: true, emit: (text) => emitBlockChunk(text, options) });
       blockChunker.reset();
-      return;
-    }
-    if (state.blockBuffer.length > 0) {
-      emitBlockChunk(state.blockBuffer);
+    } else if (state.blockBuffer.length > 0) {
+      emitBlockChunk(state.blockBuffer, options);
       state.blockBuffer = "";
     }
+    if (pendingBlockReplyTasks.size === 0) {
+      return;
+    }
+    return (async () => {
+      while (pendingBlockReplyTasks.size > 0) {
+        await Promise.allSettled(pendingBlockReplyTasks);
+      }
+    })();
   };
 
   const emitReasoningStream = (text: string) => {
@@ -665,7 +702,37 @@ export function subscribeEmbeddedPiSession(params: SubscribeEmbeddedPiSessionPar
 
   const sessionUnsubscribe = params.session.subscribe(createEmbeddedPiSessionEventHandler(ctx));
 
-  const unsubscribe = () => {
+  /**
+   * Wait for compaction cleanup to complete after abort.
+   * This ensures the compaction end event is processed before removing listeners.
+   */
+  const waitForCompactionCleanup = async (timeoutMs: number): Promise<void> => {
+    if (!state.compactionInFlight && state.pendingCompactionRetry === 0) {
+      return; // Compaction already finished
+    }
+
+    // Create a promise that resolves when compaction end is handled
+    const cleanupPromise = new Promise<void>((resolve) => {
+      state.compactionCleanupResolve = resolve;
+    });
+
+    // Race between cleanup completion and timeout
+    const timeoutPromise = new Promise<void>((_, reject) => {
+      setTimeout(() => reject(new Error("Compaction cleanup timeout")), timeoutMs);
+    });
+
+    try {
+      await Promise.race([cleanupPromise, timeoutPromise]);
+    } catch {
+      // Timeout or error - log but don't block cleanup
+      log.debug(`waitForCompactionCleanup: timeout after ${timeoutMs}ms runId=${params.runId}`);
+    } finally {
+      // Always clear the resolve function to prevent memory leaks
+      state.compactionCleanupResolve = undefined;
+    }
+  };
+
+  const unsubscribe = async () => {
     if (state.unsubscribed) {
       return;
     }
@@ -691,6 +758,9 @@ export function subscribeEmbeddedPiSession(params: SubscribeEmbeddedPiSessionPar
       log.debug(`unsubscribe: aborting in-flight compaction runId=${params.runId}`);
       try {
         params.session.abortCompaction();
+        // Wait for compaction end event to be processed before removing listeners
+        // This ensures the frontend receives the compaction end event
+        await waitForCompactionCleanup(5000);
       } catch (err) {
         log.warn(`unsubscribe: compaction abort failed runId=${params.runId} err=${String(err)}`);
       }
