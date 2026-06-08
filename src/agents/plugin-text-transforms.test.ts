@@ -9,6 +9,7 @@ import {
 import { describe, expect, it } from "vitest";
 import {
   applyPluginTextReplacements,
+  applySafeTextReplacements,
   mergePluginTextTransforms,
   transformStreamContextText,
   wrapStreamFnTextTransforms,
@@ -162,5 +163,53 @@ describe("plugin text transforms", () => {
     expect(firstEvent?.type).toBe("text_delta");
     expect(firstEvent?.delta).toBe("red basket on the left shelf");
     expect(result.content).toEqual([{ type: "text", text: "final red basket on the left shelf" }]);
+  });
+
+  describe("applySafeTextReplacements", () => {
+    it("skips replacement when matched string is part of a filesystem path", () => {
+      const result = applySafeTextReplacements(
+        "Run: ls -la ~/openclaw/config && echo use openclaw",
+        [{ from: "openclaw", to: "ocplatform" }],
+      );
+      expect(result).toBe("Run: ls -la ~/openclaw/config && echo use ocplatform");
+    });
+
+    it("applies replacement when matched string is not in a path context", () => {
+      const result = applySafeTextReplacements("the openclaw project uses openclaw brand", [
+        { from: "openclaw", to: "ocplatform" },
+      ]);
+      expect(result).toBe("the ocplatform project uses ocplatform brand");
+    });
+
+    it("handles path starting with home directory reference", () => {
+      const result = applySafeTextReplacements("Check $HOME/openclaw/AGENTS.md", [
+        { from: "openclaw", to: "ocplatform" },
+      ]);
+      expect(result).toBe("Check $HOME/openclaw/AGENTS.md");
+    });
+
+    it("applies regex replacements normally (no path check)", () => {
+      const result = applySafeTextReplacements("~/openclaw/data has openclaw content", [
+        { from: /openclaw/g, to: "ocplatform" },
+      ]);
+      expect(result).toBe("~/ocplatform/data has ocplatform content");
+    });
+
+    it("preserves text when no replacements match", () => {
+      const result = applySafeTextReplacements("no matching words here", [
+        { from: "openclaw", to: "ocplatform" },
+      ]);
+      expect(result).toBe("no matching words here");
+    });
+
+    it("returns original text for empty replacements", () => {
+      const result = applySafeTextReplacements("some text", []);
+      expect(result).toBe("some text");
+    });
+
+    it("returns original text for undefined replacements", () => {
+      const result = applySafeTextReplacements("some text", undefined);
+      expect(result).toBe("some text");
+    });
   });
 });
