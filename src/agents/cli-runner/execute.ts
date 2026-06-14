@@ -29,7 +29,10 @@ import {
 import { classifyFailoverReason } from "../embedded-agent-helpers.js";
 import { sanitizeToolArgs, sanitizeToolResult } from "../embedded-agent-subscribe.tools.js";
 import { FailoverError, resolveFailoverStatus } from "../failover-error.js";
-import { applyPluginTextReplacements } from "../plugin-text-transforms.js";
+import {
+  applyPluginTextReplacements,
+  applySafeTextReplacements,
+} from "../plugin-text-transforms.js";
 import { runClaudeLiveSessionTurn, shouldUseClaudeLiveSession } from "./claude-live-session.js";
 import { prepareClaudeCliSkillsPlugin } from "./claude-skills-plugin.js";
 import {
@@ -579,11 +582,11 @@ export async function executePreparedCliRun(
                 runId: params.runId,
                 stream: "assistant",
                 data: {
-                  text: applyPluginTextReplacements(
+                  text: applySafeTextReplacements(
                     text,
                     context.backendResolved.textTransforms?.output,
                   ),
-                  delta: applyPluginTextReplacements(
+                  delta: applySafeTextReplacements(
                     delta,
                     context.backendResolved.textTransforms?.output,
                   ),
@@ -609,7 +612,7 @@ export async function executePreparedCliRun(
             ...liveResult.output,
             rawText,
             finalPromptText: prompt,
-            text: applyPluginTextReplacements(
+            text: applySafeTextReplacements(
               rawText,
               context.backendResolved.textTransforms?.output,
             ),
@@ -630,11 +633,11 @@ export async function executePreparedCliRun(
                   runId: params.runId,
                   stream: "assistant",
                   data: {
-                    text: applyPluginTextReplacements(
+                    text: applySafeTextReplacements(
                       text,
                       context.backendResolved.textTransforms?.output,
                     ),
-                    delta: applyPluginTextReplacements(
+                    delta: applySafeTextReplacements(
                       delta,
                       context.backendResolved.textTransforms?.output,
                     ),
@@ -895,10 +898,7 @@ export async function executePreparedCliRun(
           ...parsed,
           rawText,
           finalPromptText: prompt,
-          text: applyPluginTextReplacements(
-            rawText,
-            context.backendResolved.textTransforms?.output,
-          ),
+          text: applySafeTextReplacements(rawText, context.backendResolved.textTransforms?.output),
         };
       } finally {
         restoreSkillEnv?.();
