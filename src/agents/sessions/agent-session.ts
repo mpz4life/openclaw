@@ -1832,6 +1832,7 @@ export class AgentSession {
         mode: "manual",
         settings,
         signal: this.compactionAbortController.signal,
+        compactionThinkingLevel: settings.thinkingLevel as ThinkingLevel | undefined,
       });
       if (outcome.status !== "compacted") {
         throw new Error("Compaction cancelled");
@@ -2117,6 +2118,7 @@ export class AgentSession {
         mode: "auto",
         settings,
         signal: this.autoCompactionAbortController.signal,
+        compactionThinkingLevel: settings.thinkingLevel as ThinkingLevel | undefined,
       });
       if (outcome.status === "skipped") {
         this.emit({
